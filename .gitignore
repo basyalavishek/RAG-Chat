@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Build output
+frontend/dist/
+
+# ChromaDB vector store
+backend/data/chroma/
+
+# Uploaded files
+backend/data/uploads/
+*.pdf
+*.txt
+
+# Environment
+backend/.env
+.env
+
+# TypeScript build info
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
