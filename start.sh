@@ -10,8 +10,14 @@ echo ""
 
 # --- Backend ---
 echo ">>> Setting up backend..."
-cd "$ROOT/backend"
-pip3 install -q -r requirements.txt 2>/dev/null
+VENV_PYTHON="$ROOT/backend/venv/bin/python"
+VENV_PIP="$ROOT/backend/venv/bin/pip"
+
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo "    Creating Python virtual environment..."
+    python3 -m venv "$ROOT/backend/venv"
+fi
+"$VENV_PIP" install -q -r "$ROOT/backend/requirements.txt" 2>/dev/null
 echo "    Backend dependencies ready."
 
 # --- Frontend ---
@@ -33,8 +39,8 @@ echo ""
 # Ensure Ollama is running (start if not)
 ollama serve &>/dev/null &
 
-# Start backend in background
-cd "$ROOT/backend" && python3 main.py &
+# Start backend in background using venv
+cd "$ROOT/backend" && "$VENV_PYTHON" main.py &
 BACKEND_PID=$!
 
 # Start frontend

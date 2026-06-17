@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Send, Bot, User } from "lucide-react";
-import { queryStream, sessionQueryStream } from "../api/client";
+import { queryStream, sessionQueryStream, getMessages, addMessage } from "../api/client";
 import type { Message } from "../types";
 import SourceCard from "./SourceCard";
 
@@ -18,7 +18,11 @@ export default function Chat({ sessionId }: Props) {
   }, [messages]);
 
   useEffect(() => {
-    setMessages([]);
+    if (sessionId) {
+      getMessages(sessionId).then(setMessages).catch(() => setMessages([]));
+    } else {
+      setMessages([]);
+    }
   }, [sessionId]);
 
   const handleSend = async () => {
@@ -32,12 +36,20 @@ export default function Chat({ sessionId }: Props) {
     const assistantMsg: Message = { id: assistantId, role: "assistant", content: "" };
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
+    if (sessionId) {
+      addMessage(sessionId, "user", q).catch(() => {});
+    }
+
     try {
       let full = "";
       const stream = sessionId
         ? sessionQueryStream(sessionId, q, (chunk) => { full += chunk; update(full); }, () => {})
         : queryStream(q, (chunk) => { full += chunk; update(full); }, () => {});
       await stream;
+
+      if (sessionId && full) {
+        addMessage(sessionId, "assistant", full).catch(() => {});
+      }
     } catch (err: any) {
       setMessages((prev) =>
         prev.map((m) =>

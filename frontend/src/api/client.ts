@@ -1,4 +1,4 @@
-import type { IngestResponse, QueryResponse, StatsResponse, Session } from "../types";
+import type { IngestResponse, QueryResponse, StatsResponse, Session, Message } from "../types";
 
 const BASE = "/api/v1";
 
@@ -78,6 +78,23 @@ export async function renameSession(sessionId: string, name: string): Promise<Se
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
+  });
+}
+
+export async function getMessages(sessionId: string): Promise<Message[]> {
+  return api(`/sessions/${sessionId}/messages`);
+}
+
+export async function addMessage(
+  sessionId: string,
+  role: string,
+  content: string,
+  sources?: { content: string; source: string; page?: number }[]
+): Promise<Message> {
+  return api(`/sessions/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role, content, sources }),
   });
 }
 

@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 import logging
@@ -14,6 +15,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+MESSAGES_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "session_messages.json"
+)
 
 PROMPT_TEMPLATE = """You are a helpful assistant. Answer the question based on the provided context.
 
@@ -46,7 +51,9 @@ class RAGEngine:
         )
         self._llm = None
         self._sessions: dict[str, dict] = {}
+        self._messages: dict[str, list[dict]] = {}
         self._load_sessions()
+        self._load_messages()
 
     def _load_sessions(self):
         all_meta = self.vector_store._collection.get(include=["metadatas"])
@@ -71,7 +78,21 @@ class RAGEngine:
                     clean = os.path.splitext(fname)[0][:30]
                     self._sessions[sid]["name"] = clean
 
-    @property
+    def _load_messages(self):
+        if os.path.exists(MESSAGES_FILE):
+            try:
+                with open(MESSAGES_FILE, "r") as f:
+                    self._messages = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load messages: {e}")
+                self._messages = {}
+
+    def _save_messages(self):
+        os.makedirs(os.path.dirname(MESSAGES_FILE), exist_ok=True)
+        with open(MESSAGES_FILE, "w") as f:
+            json.dump(self._messages, f, indent=2)
+
+    @property # @property decorator lets you treat a class method like a regular variable attribute.
     def llm(self):
         if self._llm is not None:
             return self._llm
@@ -105,6 +126,8 @@ class RAGEngine:
             "filenames": [],
         }
         self._sessions[sid] = session
+        self._messages[sid] = []
+        self._save_messages()
         logger.info(f"Created session {sid}")
         return session
 
@@ -125,26 +148,47 @@ class RAGEngine:
         if session_id not in self._sessions:
             return False
         self.clear(session_id=session_id)
+        self._messages.pop(session_id, None)
+        self._save_messages()
         del self._sessions[session_id]
         logger.info(f"Deleted session {session_id}")
         return True
 
+    def get_messages(self, session_id: str) -> list[dict]:
+        return self._messages.get(session_id, [])
+
+    def add_message(self, session_id: str, role: str, content: str,
+                    sources: list | None = None) -> dict:
+        msg = {
+            "id": uuid.uuid4().hex[:12],
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if sources:
+            msg["sources"] = sources
+        self._messages.setdefault(session_id, []).append(msg)
+        self._save_messages()
+        return msg
+
+
+# Data Processing Pipeline
     def ingest_file(self, file_path: str, session_id: str | None = None,
                      original_filename: str | None = None) -> int:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
-            loader = PyPDFLoader(file_path)
+            loader = PyPDFLoader(file_path) # specialized loader to extract text and structure from PDF files.
         elif ext in (".txt", ".md", ".rst"):
             loader = TextLoader(file_path, encoding="utf-8")
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
-        docs = loader.load()
-        chunks = self.text_splitter.split_documents(docs)
+        docs = loader.load() #  reads the text out of the file from your hard drive.
+        chunks = self.text_splitter.split_documents(docs) # splits the text into smaller chunks.
         sid = session_id or DEFAULT_SESSION
         for c in chunks:
             c.metadata["session_id"] = sid
-        ids = self.vector_store.add_documents(chunks)
+        ids = self.vector_store.add_documents(chunks) # embedding vectors and stores them in Chroma
         logger.info(f"Ingested {file_path} into session {sid}: {len(chunks)} chunks")
         if sid in self._sessions:
             display = original_filename or os.path.basename(file_path)
@@ -155,12 +199,14 @@ class RAGEngine:
                     self._sessions[sid]["name"] = clean
         return len(chunks)
 
+# The search engine of this RAG application
     def retrieve(self, query: str, k: int | None = None,
                  session_id: str | None = None) -> list[Document]:
         k = k or settings.top_k
         filt = self._session_filter(session_id)
         return self.vector_store.similarity_search(query, k=k, filter=filt)
 
+# all answer by llm at once
     def answer(self, query: str, session_id: str | None = None) -> dict:
         docs = self.retrieve(query, session_id=session_id)
         context = "\n\n".join(d.page_content for d in docs)
@@ -183,10 +229,12 @@ class RAGEngine:
             "sources": sources,
         }
 
+
+# answers in stream mode (Generator function : A function that use 'yield' to return values)
     async def answer_stream(self, query: str,
                             session_id: str | None = None) -> AsyncGenerator[str, None]:
-        docs = self.retrieve(query, session_id=session_id)
-        context = "\n\n".join(d.page_content for d in docs)
+        docs = self.retrieve(query, session_id=session_id) # fetches relevant documents from Chroma
+        context = "\n\n".join(d.page_content for d in docs) # concatenate them into a single context string.
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
@@ -194,6 +242,7 @@ class RAGEngine:
         async for chunk in chain.astream({"context": context, "question": query}):
             yield chunk.content
 
+# counts the number of chunks in a specific session
     def get_document_count(self, session_id: str | None = None) -> int:
         if session_id is None:
             return self.vector_store._collection.count()
@@ -201,6 +250,8 @@ class RAGEngine:
         result = self.vector_store._collection.get(where=filt)
         return len(result["ids"]) if result and result["ids"] else 0
 
+
+# removes all chunks from a specific session
     def clear(self, session_id: str | None = None) -> None:
         if session_id is None:
             docs = self.vector_store._collection.get()["ids"]

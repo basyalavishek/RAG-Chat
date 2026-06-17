@@ -26,6 +26,7 @@ export interface Message {
   role: MessageRole;
   content: string;
   sources?: Source[];
+  timestamp?: string;
 }
 
 export interface Session {

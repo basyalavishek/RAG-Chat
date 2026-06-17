@@ -1,7 +1,8 @@
 import os
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse # StreamingResponse handles real-time data streaming (like ChatGPT typing out an answer).
+
 from pydantic import BaseModel
 
 from .config import settings
@@ -21,6 +22,12 @@ class QueryResponse(BaseModel):
 
 class PatchSessionRequest(BaseModel):
     name: str | None = None
+
+
+class AddMessageRequest(BaseModel):
+    role: str
+    content: str
+    sources: list | None = None
 
 
 # --- Legacy endpoints (default session) ---
@@ -99,7 +106,7 @@ async def get_session(session_id: str):
     return session
 
 
-@router.patch("/sessions/{session_id}")
+@router.patch("/sessions/{session_id}") # update
 async def patch_session(session_id: str, body: PatchSessionRequest):
     session = engine.get_session(session_id)
     if not session:
@@ -115,6 +122,8 @@ async def delete_session(session_id: str):
         raise HTTPException(404, "Session not found")
     return {"message": "Session deleted"}
 
+
+## allows a user to upload a file into a specific, isolated chat session instead of adding it to the global, default workspace.
 
 @router.post("/sessions/{session_id}/ingest")
 async def session_ingest(session_id: str, file: UploadFile = File(...)):
@@ -144,7 +153,7 @@ async def session_ingest(session_id: str, file: UploadFile = File(...)):
         "total_documents": engine.get_document_count(session_id=session_id),
     }
 
-
+# handle asking questions (querying) inside a specific, isolated chat session.
 @router.post("/sessions/{session_id}/query")
 async def session_query(session_id: str, body: QueryRequest):
     if not engine.get_session(session_id):
@@ -179,3 +188,18 @@ async def session_clear(session_id: str):
         raise HTTPException(404, "Session not found")
     engine.clear(session_id=session_id)
     return {"message": f"Session {session_id} documents cleared"}
+
+
+@router.get("/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    if not engine.get_session(session_id):
+        raise HTTPException(404, "Session not found")
+    return engine.get_messages(session_id)
+
+
+@router.post("/sessions/{session_id}/messages")
+async def add_session_message(session_id: str, body: AddMessageRequest):
+    if not engine.get_session(session_id):
+        raise HTTPException(404, "Session not found")
+    msg = engine.add_message(session_id, body.role, body.content, body.sources)
+    return msg
