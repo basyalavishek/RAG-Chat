@@ -1,3 +1,4 @@
+
 import json
 import os
 import uuid
@@ -146,14 +147,15 @@ class RAGEngine:
     def _build_history(self, session_id: str | None) -> str:
         if not session_id:
             return ""
-        msgs = self._messages.get(session_id, [])
+        # FIX 1: Truncate history to the last 6 messages (3 turns) to prevent context explosion
+        msgs = self._messages.get(session_id, [])[-6:]
         lines = []
         for msg in msgs:
             role = "User" if msg["role"] == "user" else "Assistant"
             lines.append(f"{role}: {msg['content']}")
         return "\n".join(lines)
 
-    @property  # @property decorator lets you treat a class method like a regular variable attribute.
+    @property  
     def llm(self):
         if self._llm is not None:
             return self._llm
@@ -165,11 +167,14 @@ class RAGEngine:
                 temperature=0.3,
             )
         else:
-            from langchain_community.chat_models import ChatOllama
+            # FIX 2: Switched to the updated langchain_ollama package 
+            # and explicitly set num_ctx to 8192 to prevent local context drops
+            from langchain_ollama import ChatOllama
             self._llm = ChatOllama(
                 model=settings.ollama_model,
                 base_url=settings.ollama_base_url,
-                temperature=0.3,
+                temperature=0.1,  # Tighter control over creative hallucinations
+                num_ctx=8192,
             )
         return self._llm
 
@@ -243,24 +248,22 @@ class RAGEngine:
         self._save_messages()
         return msg
 
-
-# Data Processing Pipeline
     def ingest_file(self, file_path: str, session_id: str | None = None,
                      original_filename: str | None = None) -> int:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
-            loader = PyPDFLoader(file_path) # specialized loader to extract text and structure from PDF files.
+            loader = PyPDFLoader(file_path)
         elif ext in (".txt", ".md", ".rst"):
             loader = TextLoader(file_path, encoding="utf-8")
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
-        docs = loader.load() #  reads the text out of the file from your hard drive.
-        chunks = self.text_splitter.split_documents(docs) # splits the text into smaller chunks.
+        docs = loader.load()
+        chunks = self.text_splitter.split_documents(docs)
         sid = session_id or DEFAULT_SESSION
         for c in chunks:
             c.metadata["session_id"] = sid
-        ids = self.vector_store.add_documents(chunks) # embedding vectors and stores them in Chroma
+        ids = self.vector_store.add_documents(chunks) # generate and save  embeddings to vector store
         logger.info(f"Ingested {file_path} into session {sid}: {len(chunks)} chunks")
         if sid in self._sessions:
             display = original_filename or os.path.basename(file_path)
@@ -272,18 +275,36 @@ class RAGEngine:
                 self._save_sessions()
         return len(chunks)
 
-# The search engine of this RAG application
     def retrieve(self, query: str, k: int | None = None,
                  session_id: str | None = None) -> list[Document]:
         k = k or settings.top_k
         filt = self._session_filter(session_id)
         return self.vector_store.similarity_search(query, k=k, filter=filt)
 
-# all answer by llm at once
+    def _get_standalone_query(self, query: str, history: str) -> str:
+        # FIX 3: Internal helper to rewrite follow-up queries so the retriever doesn't fetch garbage.
+        if not history:
+            return query
+            
+        condense_prompt = ChatPromptTemplate.from_template(
+            "Given the conversation history and a follow-up question, rephrase the follow-up "
+            "question into a standalone question for a vector database search.\n\n"
+            "History:\n{history}\n\n"
+            "Follow-up Question: {query}\n\n"
+            "Standalone Question (Output only the clean question text):"
+        )
+        chain = condense_prompt | self.llm
+        response = chain.invoke({"history": history, "query": query})
+        return response.content.strip()
+
     def answer(self, query: str, session_id: str | None = None) -> dict:
-        docs = self.retrieve(query, session_id=session_id)
-        context = "\n\n".join(d.page_content for d in docs)
         history = self._build_history(session_id)
+        
+        # Rewrite query contextually before matching vectors
+        search_query = self._get_standalone_query(query, history)
+        
+        docs = self.retrieve(search_query, session_id=session_id)
+        context = "\n\n".join(d.page_content for d in docs)
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
@@ -303,13 +324,15 @@ class RAGEngine:
             "sources": sources,
         }
 
-
-# answers in stream mode (Generator function : A function that use 'yield' to return values)
     async def answer_stream(self, query: str,
                             session_id: str | None = None) -> AsyncGenerator[str, None]:
-        docs = self.retrieve(query, session_id=session_id) # fetches relevant documents from Chroma
-        context = "\n\n".join(d.page_content for d in docs) # concatenate them into a single context string.
         history = self._build_history(session_id)
+        
+        # Rewrite query contextually before matching vectors
+        search_query = self._get_standalone_query(query, history)
+        
+        docs = self.retrieve(search_query, session_id=session_id)
+        context = "\n\n".join(d.page_content for d in docs)
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
@@ -317,7 +340,6 @@ class RAGEngine:
         async for chunk in chain.astream({"history": history, "context": context, "question": query}):
             yield chunk.content
 
-# counts the number of chunks in a specific session
     def get_document_count(self, session_id: str | None = None) -> int:
         if session_id is None:
             return self.vector_store._collection.count()
@@ -325,8 +347,6 @@ class RAGEngine:
         result = self.vector_store._collection.get(where=filt)
         return len(result["ids"]) if result and result["ids"] else 0
 
-
-# removes all chunks from a specific session
     def clear(self, session_id: str | None = None) -> None:
         if session_id is None:
             docs = self.vector_store._collection.get()["ids"]
