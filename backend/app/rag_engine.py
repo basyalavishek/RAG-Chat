@@ -11,16 +11,18 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
+from sqlmodel import Session, select, delete
 
 from .config import settings
+from .database import engine as db_engine, init_db
+from .models import SessionInDB, MessageInDB
 
 logger = logging.getLogger(__name__)
 
-MESSAGES_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "data", "session_messages.json"
-)
+PROMPT_TEMPLATE = """You are a helpful assistant. Answer the question based on the provided context and conversation history.
 
-PROMPT_TEMPLATE = """You are a helpful assistant. Answer the question based on the provided context.
+Conversation History:
+{history}
 
 Context:
 {context}
@@ -52,10 +54,37 @@ class RAGEngine:
         self._llm = None
         self._sessions: dict[str, dict] = {}
         self._messages: dict[str, list[dict]] = {}
+        self._saved_message_ids: set[str] = set()
+        self._init_db()
         self._load_sessions()
         self._load_messages()
 
+    def _init_db(self):
+        init_db()
+
+    def _save_sessions(self):
+        with Session(db_engine) as session:
+            for sid, s in self._sessions.items():
+                db_session = SessionInDB(
+                    id=sid,
+                    name=s["name"],
+                    created_at=s["created_at"],
+                    filenames=json.dumps(s["filenames"]),
+                )
+                session.merge(db_session)
+            session.commit()
+
     def _load_sessions(self):
+        with Session(db_engine) as session:
+            rows = session.exec(select(SessionInDB)).all()
+            for row in rows:
+                self._sessions[row.id] = {
+                    "id": row.id,
+                    "name": row.name,
+                    "created_at": row.created_at,
+                    "filenames": json.loads(row.filenames),
+                }
+
         all_meta = self.vector_store._collection.get(include=["metadatas"])
         seen = set()
         for m in all_meta["metadatas"] or []:
@@ -77,22 +106,54 @@ class RAGEngine:
                 if self._sessions[sid]["name"] in (DEFAULT_SESSION, f"Chat {sid[:8]}"):
                     clean = os.path.splitext(fname)[0][:30]
                     self._sessions[sid]["name"] = clean
+        self._save_sessions()
 
     def _load_messages(self):
-        if os.path.exists(MESSAGES_FILE):
-            try:
-                with open(MESSAGES_FILE, "r") as f:
-                    self._messages = json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to load messages: {e}")
-                self._messages = {}
+        with Session(db_engine) as session:
+            rows = session.exec(
+                select(MessageInDB).order_by(MessageInDB.timestamp)
+            ).all()
+            for row in rows:
+                msg = {
+                    "id": row.id,
+                    "role": row.role,
+                    "content": row.content,
+                    "timestamp": row.timestamp,
+                }
+                if row.sources:
+                    msg["sources"] = json.loads(row.sources)
+                self._messages.setdefault(row.session_id, []).append(msg)
+                self._saved_message_ids.add(row.id)
 
     def _save_messages(self):
-        os.makedirs(os.path.dirname(MESSAGES_FILE), exist_ok=True)
-        with open(MESSAGES_FILE, "w") as f:
-            json.dump(self._messages, f, indent=2)
+        with Session(db_engine) as session:
+            for sid, msgs in self._messages.items():
+                for msg in msgs:
+                    if msg["id"] in self._saved_message_ids:
+                        continue
+                    db_msg = MessageInDB(
+                        id=msg["id"],
+                        session_id=sid,
+                        role=msg["role"],
+                        content=msg["content"],
+                        timestamp=msg["timestamp"],
+                        sources=json.dumps(msg.get("sources")) if msg.get("sources") else None,
+                    )
+                    session.add(db_msg)
+                    self._saved_message_ids.add(msg["id"])
+            session.commit()
 
-    @property # @property decorator lets you treat a class method like a regular variable attribute.
+    def _build_history(self, session_id: str | None) -> str:
+        if not session_id:
+            return ""
+        msgs = self._messages.get(session_id, [])
+        lines = []
+        for msg in msgs:
+            role = "User" if msg["role"] == "user" else "Assistant"
+            lines.append(f"{role}: {msg['content']}")
+        return "\n".join(lines)
+
+    @property  # @property decorator lets you treat a class method like a regular variable attribute.
     def llm(self):
         if self._llm is not None:
             return self._llm
@@ -127,7 +188,7 @@ class RAGEngine:
         }
         self._sessions[sid] = session
         self._messages[sid] = []
-        self._save_messages()
+        self._save_sessions()
         logger.info(f"Created session {sid}")
         return session
 
@@ -135,6 +196,7 @@ class RAGEngine:
         if session_id not in self._sessions:
             return False
         self._sessions[session_id]["name"] = name
+        self._save_sessions()
         logger.info(f"Renamed session {session_id} -> {name}")
         return True
 
@@ -148,9 +210,19 @@ class RAGEngine:
         if session_id not in self._sessions:
             return False
         self.clear(session_id=session_id)
-        self._messages.pop(session_id, None)
-        self._save_messages()
+        msgs = self._messages.pop(session_id, [])
+        with Session(db_engine) as session:
+            session.exec(
+                delete(MessageInDB).where(MessageInDB.session_id == session_id)
+            )
+            session.exec(
+                delete(SessionInDB).where(SessionInDB.id == session_id)
+            )
+            session.commit()
+        for msg in msgs:
+            self._saved_message_ids.discard(msg["id"])
         del self._sessions[session_id]
+        self._save_sessions()
         logger.info(f"Deleted session {session_id}")
         return True
 
@@ -197,6 +269,7 @@ class RAGEngine:
                 if self._sessions[sid]["name"].startswith("Chat "):
                     clean = os.path.splitext(display)[0][:30]
                     self._sessions[sid]["name"] = clean
+                self._save_sessions()
         return len(chunks)
 
 # The search engine of this RAG application
@@ -210,10 +283,11 @@ class RAGEngine:
     def answer(self, query: str, session_id: str | None = None) -> dict:
         docs = self.retrieve(query, session_id=session_id)
         context = "\n\n".join(d.page_content for d in docs)
+        history = self._build_history(session_id)
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
-        response = chain.invoke({"context": context, "question": query})
+        response = chain.invoke({"history": history, "context": context, "question": query})
 
         sources = [
             {
@@ -235,11 +309,12 @@ class RAGEngine:
                             session_id: str | None = None) -> AsyncGenerator[str, None]:
         docs = self.retrieve(query, session_id=session_id) # fetches relevant documents from Chroma
         context = "\n\n".join(d.page_content for d in docs) # concatenate them into a single context string.
+        history = self._build_history(session_id)
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
 
-        async for chunk in chain.astream({"context": context, "question": query}):
+        async for chunk in chain.astream({"history": history, "context": context, "question": query}):
             yield chunk.content
 
 # counts the number of chunks in a specific session

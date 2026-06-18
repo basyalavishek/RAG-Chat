@@ -5,6 +5,7 @@ import DocumentUpload from "./components/DocumentUpload";
 import { listSessions, createSession, deleteSession, renameSession } from "./api/client";
 import type { Session } from "./types";
 
+// switching between chats, renaming a chat title, and deleting a chat session.
 function SessionItem({ s, active, onSelect, onDelete, onRename }: {
   s: Session;
   active: boolean;
@@ -66,6 +67,7 @@ function SessionItem({ s, active, onSelect, onDelete, onRename }: {
   );
 }
 
+
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -106,8 +108,6 @@ export default function App() {
     setSessions((prev) => prev.map((s) => (s.id === id ? updated : s)));
   };
 
-  const activeSession = sessions.find((s) => s.id === activeId);
-
   return (
     <div className="h-screen flex flex-col max-w-6xl mx-auto">
       <header className="flex items-center justify-between px-6 py-3 border-b border-gray-800 shrink-0">
@@ -142,11 +142,9 @@ export default function App() {
             ))}
           </div>
 
-          {activeSession && (
-            <div className="border-t border-gray-800 p-3 space-y-3">
-              <DocumentUpload sessionId={activeId} onStatsChange={loadSessions} />
-            </div>
-          )}
+          <div className="border-t border-gray-800 p-3 space-y-3">
+            <DocumentUpload sessionId={activeId} onStatsChange={loadSessions} />
+          </div>
         </aside>
 
         <Chat sessionId={activeId} />
