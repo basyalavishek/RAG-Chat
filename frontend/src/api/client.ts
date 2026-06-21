@@ -1,4 +1,4 @@
-import type { IngestResponse, QueryResponse, StatsResponse, Session, Message } from "../types";
+import type { QueryResponse, StatsResponse, Session, Message } from "../types";
 
 const BASE = "/api/v1";
 
@@ -14,7 +14,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 // --- Legacy (default session) ---
 
-export async function ingestFile(file: File): Promise<IngestResponse> {
+export async function ingestFile(file: File): Promise<{ task_id: string; filename: string }> {
   const form = new FormData();
   form.append("file", file);
   return api("/ingest", { method: "POST", body: form });
@@ -24,8 +24,8 @@ export async function queryStream(
   q: string,
   onChunk: (text: string) => void,
   onDone: () => void
-): Promise<void> {
-  await streamFrom("/query/stream", q, onChunk, onDone);
+): Promise<{ sources?: { content: string; source: string; page?: number }[] }> {
+  return streamFrom("/query/stream", q, onChunk, onDone);
 }
 
 export async function getStats(): Promise<StatsResponse> {
@@ -50,10 +50,23 @@ export async function deleteSession(id: string): Promise<void> {
   await api(`/sessions/${id}`, { method: "DELETE" });
 }
 
-export async function sessionIngestFile(sessionId: string, file: File): Promise<IngestResponse> {
+export async function sessionIngestFile(sessionId: string, file: File): Promise<{ task_id: string; filename: string }> {
   const form = new FormData();
   form.append("file", file);
   return api(`/sessions/${sessionId}/ingest`, { method: "POST", body: form });
+}
+
+export interface IngestTaskStatus {
+  status: "pending" | "processing" | "completed" | "failed";
+  progress: number;
+  step: string;
+  message: string;
+  filename?: string;
+  chunks?: number;
+}
+
+export async function getIngestTask(taskId: string): Promise<IngestTaskStatus> {
+  return api(`/ingest/task/${taskId}`);
 }
 
 export async function sessionQueryStream(
@@ -61,8 +74,8 @@ export async function sessionQueryStream(
   q: string,
   onChunk: (text: string) => void,
   onDone: () => void
-): Promise<void> {
-  await streamFrom(`/sessions/${sessionId}/query/stream`, q, onChunk, onDone);
+): Promise<{ sources?: { content: string; source: string; page?: number }[] }> {
+  return streamFrom(`/sessions/${sessionId}/query/stream`, q, onChunk, onDone);
 }
 
 export async function sessionClear(sessionId: string): Promise<void> {
@@ -105,7 +118,7 @@ async function streamFrom(
   q: string,
   onChunk: (text: string) => void,
   onDone: () => void,
-): Promise<void> {
+): Promise<{ sources?: { content: string; source: string; page?: number }[] }> {
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -118,10 +131,34 @@ async function streamFrom(
   const reader = res.body?.getReader();
   if (!reader) throw new Error("No response body");
   const decoder = new TextDecoder();
+  let buffer = "";
+  let sources: { content: string; source: string; page?: number }[] | undefined;
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    onChunk(decoder.decode(value, { stream: true }));
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6);
+      if (data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data);
+        if ("t" in parsed) {
+          onChunk(parsed.t);
+        }
+        if ("s" in parsed) {
+          sources = parsed.s;
+        }
+      } catch {
+        // ignore malformed JSON
+      }
+    }
   }
   onDone();
+  return { sources };
 }

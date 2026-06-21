@@ -42,13 +42,20 @@ export default function Chat({ sessionId }: Props) {
 
     try {
       let full = "";
-      const stream = sessionId
+      const result = await (sessionId
         ? sessionQueryStream(sessionId, q, (chunk) => { full += chunk; update(full); }, () => {})
-        : queryStream(q, (chunk) => { full += chunk; update(full); }, () => {});
-      await stream;
+        : queryStream(q, (chunk) => { full += chunk; update(full); }, () => {}));
 
       if (sessionId && full) {
-        addMessage(sessionId, "assistant", full).catch(() => {});
+        addMessage(sessionId, "assistant", full, result?.sources).catch(() => {});
+      }
+
+      if (result?.sources) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId ? { ...m, sources: result.sources as any } : m
+          )
+        );
       }
     } catch (err: any) {
       setMessages((prev) =>

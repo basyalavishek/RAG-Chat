@@ -44,17 +44,16 @@ async def ingest(file: UploadFile = File(...)):
     with open(dest, "wb") as f:
         f.write(await file.read())
 
-    try:
-        chunks = engine.ingest_file(dest, original_filename=file.filename)
-    except Exception as e:
-        os.remove(dest)
-        raise HTTPException(500, str(e))
+    task_id = engine.start_ingest(dest, original_filename=file.filename)
+    return {"task_id": task_id, "filename": file.filename}
 
-    return {
-        "filename": file.filename,
-        "chunks": chunks,
-        "total_documents": engine.get_document_count(),
-    }
+
+@router.get("/ingest/task/{task_id}")
+async def get_ingest_task(task_id: str):
+    task = engine.get_ingest_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task
 
 
 @router.post("/query", response_model=QueryResponse)
@@ -140,18 +139,9 @@ async def session_ingest(session_id: str, file: UploadFile = File(...)):
     with open(dest, "wb") as f:
         f.write(await file.read())
 
-    try:
-        chunks = engine.ingest_file(dest, session_id=session_id,
-                                     original_filename=file.filename)
-    except Exception as e:
-        os.remove(dest)
-        raise HTTPException(500, str(e))
-
-    return {
-        "filename": file.filename,
-        "chunks": chunks,
-        "total_documents": engine.get_document_count(session_id=session_id),
-    }
+    task_id = engine.start_ingest(dest, session_id=session_id,
+                                   original_filename=file.filename)
+    return {"task_id": task_id, "filename": file.filename}
 
 # handle asking questions (querying) inside a specific, isolated chat session.
 @router.post("/sessions/{session_id}/query")

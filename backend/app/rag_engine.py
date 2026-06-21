@@ -3,11 +3,12 @@ import json
 import os
 import uuid
 import logging
+import concurrent.futures
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -25,13 +26,16 @@ PROMPT_TEMPLATE = """You are a helpful assistant. Answer the question based on t
 Conversation History:
 {history}
 
-Context:
+Context (sources are numbered in brackets):
 {context}
 
 Question:
 {question}
 
-Answer the question concisely and accurately. If the context doesn't contain enough information, say so.
+Instructions:
+- Answer concisely and accurately.
+- When you use information from a specific source, cite it using its bracketed number (e.g., [1], [2]).
+- If the context doesn't contain enough information, say so.
 """
 
 DEFAULT_SESSION = "default"
@@ -56,6 +60,8 @@ class RAGEngine:
         self._sessions: dict[str, dict] = {}
         self._messages: dict[str, list[dict]] = {}
         self._saved_message_ids: set[str] = set()
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._tasks: dict[str, dict] = {}
         self._init_db()
         self._load_sessions()
         self._load_messages()
@@ -249,21 +255,37 @@ class RAGEngine:
         return msg
 
     def ingest_file(self, file_path: str, session_id: str | None = None,
-                     original_filename: str | None = None) -> int:
+                     original_filename: str | None = None,
+                     progress_callback: callable | None = None) -> int:
+        if progress_callback:
+            progress_callback(5, "loading", "Loading file...")
+
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
-            loader = PyPDFLoader(file_path)
+            loader = PyMuPDFLoader(file_path)
         elif ext in (".txt", ".md", ".rst"):
             loader = TextLoader(file_path, encoding="utf-8")
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
         docs = loader.load()
+
+        if progress_callback:
+            progress_callback(40, "chunking", "Splitting into chunks...")
+
         chunks = self.text_splitter.split_documents(docs)
         sid = session_id or DEFAULT_SESSION
         for c in chunks:
             c.metadata["session_id"] = sid
+
+        if progress_callback:
+            progress_callback(50, "embedding", f"Embedding {len(chunks)} chunks...")
+
         ids = self.vector_store.add_documents(chunks) # generate and save  embeddings to vector store
+
+        if progress_callback:
+            progress_callback(90, "saving", "Saving session...")
+
         logger.info(f"Ingested {file_path} into session {sid}: {len(chunks)} chunks")
         if sid in self._sessions:
             display = original_filename or os.path.basename(file_path)
@@ -273,7 +295,43 @@ class RAGEngine:
                     clean = os.path.splitext(display)[0][:30]
                     self._sessions[sid]["name"] = clean
                 self._save_sessions()
+
+        if progress_callback:
+            progress_callback(100, "done", f"Indexed {len(chunks)} chunks")
+
         return len(chunks)
+
+    def start_ingest(self, file_path: str, session_id: str | None = None,
+                      original_filename: str | None = None) -> str:
+        task_id = uuid.uuid4().hex[:12]
+        self._tasks[task_id] = {
+            "status": "pending",
+            "progress": 0,
+            "step": "queued",
+            "message": "Queued...",
+        }
+
+        def _run():
+            try:
+                def progress(p, s, m):
+                    if task_id in self._tasks:
+                        self._tasks[task_id].update({"progress": p, "step": s, "message": m})
+
+                self._tasks[task_id]["status"] = "processing"
+                chunks = self.ingest_file(file_path, session_id, original_filename,
+                                           progress_callback=progress)
+                self._tasks[task_id].update(status="completed", chunks=chunks,
+                                             message=f"Indexed {chunks} chunks")
+            except Exception as e:
+                logger.exception(f"Background ingest {task_id} failed")
+                if task_id in self._tasks:
+                    self._tasks[task_id].update(status="failed", message=str(e))
+
+        self._executor.submit(_run)
+        return task_id
+
+    def get_ingest_task(self, task_id: str) -> dict | None:
+        return self._tasks.get(task_id)
 
     def retrieve(self, query: str, k: int | None = None,
                  session_id: str | None = None) -> list[Document]:
@@ -304,7 +362,7 @@ class RAGEngine:
         search_query = self._get_standalone_query(query, history)
         
         docs = self.retrieve(search_query, session_id=session_id)
-        context = "\n\n".join(d.page_content for d in docs)
+        context = "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
@@ -332,13 +390,24 @@ class RAGEngine:
         search_query = self._get_standalone_query(query, history)
         
         docs = self.retrieve(search_query, session_id=session_id)
-        context = "\n\n".join(d.page_content for d in docs)
+        context = "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
 
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
         chain = prompt | self.llm
 
         async for chunk in chain.astream({"history": history, "context": context, "question": query}):
-            yield chunk.content
+            yield f"data: {json.dumps({'t': chunk.content})}\n\n"
+
+        sources = [
+            {
+                "content": d.page_content[:500],
+                "source": d.metadata.get("source", "unknown"),
+                "page": d.metadata.get("page"),
+            }
+            for d in docs
+        ]
+        yield f"data: {json.dumps({'s': sources})}\n\n"
+        yield "data: [DONE]\n\n"
 
     def get_document_count(self, session_id: str | None = None) -> int:
         if session_id is None:

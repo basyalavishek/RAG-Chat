@@ -1,6 +1,6 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Upload, FileText, Check, Loader2, Trash2 } from "lucide-react";
-import { sessionIngestFile, sessionClear, ingestFile, clearDocuments } from "../api/client";
+import { sessionIngestFile, sessionClear, ingestFile, clearDocuments, getIngestTask } from "../api/client";
 
 interface Props {
   sessionId: string | null;
@@ -9,23 +9,57 @@ interface Props {
 
 export default function DocumentUpload({ sessionId, onStatsChange }: Props) {
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [stepMsg, setStepMsg] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval>>(undefined);
+
+  useEffect(() => {
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
+    setProgress(0);
+    setStepMsg("Starting...");
     setMsg(null);
+
     try {
-      const ingest = sessionId ? sessionIngestFile : ingestFile;
-      const res = await (sessionId ? sessionIngestFile(sessionId, file) : ingestFile(file));
-      setMsg({ ok: true, text: `"${res.filename}" — ${res.chunks} chunks indexed` });
-      onStatsChange();
+      const { task_id } = await (sessionId
+        ? sessionIngestFile(sessionId, file)
+        : ingestFile(file));
+
+      await new Promise<void>((resolve, reject) => {
+        pollRef.current = setInterval(async () => {
+          try {
+            const task = await getIngestTask(task_id);
+            setProgress(task.progress);
+            setStepMsg(task.message);
+
+            if (task.status === "completed") {
+              clearInterval(pollRef.current);
+              setMsg({ ok: true, text: `"${file.name}" — ${task.chunks} chunks indexed` });
+              onStatsChange();
+              resolve();
+            } else if (task.status === "failed") {
+              clearInterval(pollRef.current);
+              reject(new Error(task.message));
+            }
+          } catch (err) {
+            clearInterval(pollRef.current);
+            reject(err);
+          }
+        }, 500);
+      });
     } catch (err: any) {
       setMsg({ ok: false, text: err.message });
     } finally {
       setUploading(false);
+      setProgress(0);
+      setStepMsg("");
       if (inputRef.current) inputRef.current.value = "";
     }
   };
@@ -50,7 +84,7 @@ export default function DocumentUpload({ sessionId, onStatsChange }: Props) {
       <label className="flex items-center gap-2 px-4 py-2.5 border-2 border-dashed border-gray-600 rounded-xl cursor-pointer hover:border-blue-500 transition-colors">
         <Upload size={18} className="text-gray-400" />
         <span className="text-sm text-gray-400">
-          {uploading ? "Uploading..." : "Upload PDF, TXT, or MD"}
+          {uploading ? "Processing..." : "Upload PDF, TXT, or MD"}
         </span>
         <input
           ref={inputRef}
@@ -63,6 +97,18 @@ export default function DocumentUpload({ sessionId, onStatsChange }: Props) {
         {uploading && <Loader2 size={16} className="animate-spin ml-auto" />}
         {!uploading && <FileText size={16} className="ml-auto text-gray-500" />}
       </label>
+
+      {uploading && (
+        <div className="space-y-1 px-1">
+          <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-300"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+          <p className="text-xs text-gray-500">{stepMsg}</p>
+        </div>
+      )}
 
       {msg && (
         <div
