@@ -29,6 +29,3 @@ This installs dependencies and starts both backend (port 8000) and frontend (por
 - Runs on CPU only (old NVIDIA driver, no GPU acceleration)
 - ChromaDB telemetry errors in logs are harmless
 
-## Notes
-
-Built with OpenCode (AI-assisted coding tool).
