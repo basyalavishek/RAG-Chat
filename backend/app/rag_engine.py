@@ -5,14 +5,25 @@ import uuid
 import logging
 import concurrent.futures
 from datetime import datetime, timezone
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Callable
+
+# Patch chromadb telemetry before any chromadb import
+try:
+    import chromadb.telemetry.product.posthog as _ch_posthog
+    _orig_direct = _ch_posthog.Posthog._direct_capture
+    def _noop_direct(self, event):
+        pass
+    _ch_posthog.Posthog._direct_capture = _noop_direct
+except Exception:
+    pass
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyMuPDFLoader, TextLoader
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
+from chromadb.config import Settings as ChromaSettings
 from sqlmodel import Session, select, delete
 
 from .config import settings
@@ -50,6 +61,9 @@ class RAGEngine:
             persist_directory=settings.chroma_persist_dir,
             embedding_function=self.embeddings,
             collection_name="documents",
+            client_settings=ChromaSettings(
+                anonymized_telemetry=False,
+            ),
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.chunk_size,
@@ -256,7 +270,7 @@ class RAGEngine:
 
     def ingest_file(self, file_path: str, session_id: str | None = None,
                      original_filename: str | None = None,
-                     progress_callback: callable | None = None) -> int:
+                     progress_callback: Callable | None = None) -> int:
         if progress_callback:
             progress_callback(5, "loading", "Loading file...")
 
